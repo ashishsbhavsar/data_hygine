@@ -1286,9 +1286,19 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
         "updatedBy": "xxx@amd.com"
     })
     
-    # Update Top-level History for Monitoring (Monolith fallback)
-    if "history" not in snap_data:
+    # Update Top-level History for Monitoring
+    if "history" not in snap_data or not isinstance(snap_data["history"], dict):
         snap_data["history"] = {"from": [], "to": [], "valueField": [], "source": []}
+    
+    # Ensure all required list fields exist
+    for f in ["from", "to", "valueField", "source"]:
+        if f not in snap_data["history"] or not isinstance(snap_data["history"][f], list):
+            snap_data["history"][f] = []
+
+    snap_data["history"]["from"].append(original_value)
+    snap_data["history"]["to"].append(req.accepted_value)
+    snap_data["history"]["valueField"].append(req.field_name)
+    snap_data["history"]["source"].append(value_source)
     snap_data["history"]["updatedOn"] = now_str
     snap_data["history"]["updatedBy"] = "xxx@amd.com"
     snap_data["history"]["last_action"] = f"Approved {req.field_name}"
@@ -1378,6 +1388,13 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
                 "from": meta_original_value,
                 "to": meta_accepted_value or meta_original_value
             })
+
+            # Also update Top-level lists for cascades
+            snap_data["history"]["from"].append(meta_original_value)
+            snap_data["history"]["to"].append(meta_accepted_value or meta_original_value)
+            snap_data["history"]["valueField"].append(meta_name)
+            snap_data["history"]["source"].append(value_source)
+
         print(f"[DEBUG] Cascade complete. {len(cascaded_changes)} metadata fields updated.")
     
     # 5. Check for Overall Validity (Standardization Status)
@@ -1396,7 +1413,7 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
 
     print(f"[DEBUG] Final resolution check: {'SUCCESS' if is_fully_resolved else 'STILL PENDING'}")
 
-    # 6. Update Top-level History (Preserve for monitoring)
+    # 6. Final Timestamp Sync
     if "history" not in snap_data:
         snap_data["history"] = {}
     snap_data["history"]["updatedOn"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -1531,25 +1548,39 @@ async def reject_record(req: RejectRecordRequest):
                 "updatedBy": "xxx@amd.com"
             })
             
-            # Update Top-level History for monitoring
-            if "history" not in snap_data:
+            # Update Top-level History lists
+            if "history" not in snap_data or not isinstance(snap_data["history"], dict):
                 snap_data["history"] = {"from": [], "to": [], "valueField": [], "source": []}
-            snap_data["history"]["updatedOn"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-            snap_data["history"]["updatedBy"] = "xxx@amd.com"
-            snap_data["history"]["last_action"] = "Bulk Reject"
             
+            for f in ["from", "to", "valueField", "source"]:
+                if f not in snap_data["history"] or not isinstance(snap_data["history"][f], list):
+                    snap_data["history"][f] = []
+
+            # Add primary item to top-level history
+            snap_data["history"]["from"].append(val)
+            snap_data["history"]["to"].append(action_value)
+            snap_data["history"]["valueField"].append(item.get("field"))
+            snap_data["history"]["source"].append("reject")
+
             for sug in meta.get("comparingData", []):
                 sug["status"] = "Rejected"
-    
+            
+            # Add metadata item to top-level history
+            snap_data["history"]["from"].append(meta_val)
+            snap_data["history"]["to"].append(action_value)
+            snap_data["history"]["valueField"].append(meta.get("name"))
+            snap_data["history"]["source"].append("reject")
+
     # 3. Transition Standardization Status
     snap_data["standardization_status"] = "REJECTED"
     snap_data["reason"] = "L0 Junk Data."
     
-    # 4. Update Top-level History (Preserve for Monitoring)
+    # 4. Update Top-level History Timestamps
     if "history" not in snap_data:
         snap_data["history"] = {}
     snap_data["history"]["updatedOn"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     snap_data["history"]["updatedBy"] = "xxx@amd.com"
+    snap_data["history"]["last_action"] = "Bulk Reject"
     
     # 5. Update Executioninfo to include the entitliment_level and applied updates
     ei_doc = await db[EXECUTION_INFO_COL].find_one({"benchmarkExecutionID": execution_id})
@@ -1731,9 +1762,19 @@ async def create_masterlist_draft(type_name: str, draft: DraftRecordRequest):
         snap_data["standardization_status"] = "On Hold"
         snap_data["reason"] = "New Masterlist Draft Record."
         
-        # Update Top-level History (Preserve for Monitoring)
-        if "history" not in snap_data:
-            snap_data["history"] = {}
+        # Update Top-level History lists
+        if "history" not in snap_data or not isinstance(snap_data["history"], dict):
+            snap_data["history"] = {"from": [], "to": [], "valueField": [], "source": []}
+        
+        for f in ["from", "to", "valueField", "source"]:
+            if f not in snap_data["history"] or not isinstance(snap_data["history"][f], list):
+                snap_data["history"][f] = []
+
+        snap_data["history"]["from"].append(old_val)
+        snap_data["history"]["to"].append(value)
+        snap_data["history"]["valueField"].append(item.get("field"))
+        snap_data["history"]["source"].append("draft")
+
         snap_data["history"]["updatedOn"] = now_str
         snap_data["history"]["updatedBy"] = "xxx@amd.com"
         snap_data["history"]["last_action"] = "Placed On Hold (Draft created)"
