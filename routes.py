@@ -1275,15 +1275,23 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
     target_item["currentStatus"] = req.currentStatus
     target_item["value"] = req.accepted_value
     
+    now_str = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     if "history" not in target_item:
         target_item["history"] = []
     target_item["history"].append({
         "from": original_value,
         "to": req.accepted_value,
         "source": value_source,
-        "updatedOn": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "updatedOn": now_str,
         "updatedBy": "xxx@amd.com"
     })
+    
+    # Update Top-level History for Monitoring (Monolith fallback)
+    if "history" not in snap_data:
+        snap_data["history"] = {"from": [], "to": [], "valueField": [], "source": []}
+    snap_data["history"]["updatedOn"] = now_str
+    snap_data["history"]["updatedBy"] = "xxx@amd.com"
+    snap_data["history"]["last_action"] = f"Approved {req.field_name}"
     
     print(f"[DEBUG] Target field status set to 'Accepted' and currentStatus to '{req.currentStatus}'")
         
@@ -1329,9 +1337,10 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
                     else:
                         sug["status"] = "Rejected"
             else:
-                # Dropdown case: reject all metadata suggestions
+                # Dropdown case: reject all metadata suggestions but preserve their values
                 for sug in meta_comparing:
                     sug["status"] = "Rejected"
+                meta_accepted_value = meta_original_value # Keep current value
             
             # Mark metadata as Accepted and update the value field in the snapshot
             meta_item["validation_status"] = "Accepted"
@@ -1345,7 +1354,7 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
                     "from": meta_original_value,
                     "to": meta_accepted_value,
                     "source": value_source,
-                    "updatedOn": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                    "updatedOn": now_str,
                     "updatedBy": "xxx@amd.com"
                 })
             
@@ -1387,9 +1396,11 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
 
     print(f"[DEBUG] Final resolution check: {'SUCCESS' if is_fully_resolved else 'STILL PENDING'}")
 
-    # 6. Update History (Top level history removed)
-    if "history" in snap_data:
-        del snap_data["history"]
+    # 6. Update Top-level History (Preserve for monitoring)
+    if "history" not in snap_data:
+        snap_data["history"] = {}
+    snap_data["history"]["updatedOn"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    snap_data["history"]["updatedBy"] = "xxx@amd.com"
 
     # 7. Final Acceptance Transition & Consistency Sync
     if is_fully_resolved:
@@ -1520,6 +1531,13 @@ async def reject_record(req: RejectRecordRequest):
                 "updatedBy": "xxx@amd.com"
             })
             
+            # Update Top-level History for monitoring
+            if "history" not in snap_data:
+                snap_data["history"] = {"from": [], "to": [], "valueField": [], "source": []}
+            snap_data["history"]["updatedOn"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            snap_data["history"]["updatedBy"] = "xxx@amd.com"
+            snap_data["history"]["last_action"] = "Bulk Reject"
+            
             for sug in meta.get("comparingData", []):
                 sug["status"] = "Rejected"
     
@@ -1527,9 +1545,11 @@ async def reject_record(req: RejectRecordRequest):
     snap_data["standardization_status"] = "REJECTED"
     snap_data["reason"] = "L0 Junk Data."
     
-    # 4. Remove Top-Level History (if exists)
-    if "history" in snap_data:
-        del snap_data["history"]
+    # 4. Update Top-level History (Preserve for Monitoring)
+    if "history" not in snap_data:
+        snap_data["history"] = {}
+    snap_data["history"]["updatedOn"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    snap_data["history"]["updatedBy"] = "xxx@amd.com"
     
     # 5. Update Executioninfo to include the entitliment_level and applied updates
     ei_doc = await db[EXECUTION_INFO_COL].find_one({"benchmarkExecutionID": execution_id})
@@ -1679,30 +1699,30 @@ async def create_masterlist_draft(type_name: str, draft: DraftRecordRequest):
             if str(item.get("value", "")).strip().lower() != str(value).strip().lower():
                 continue
             
-            # Only update currentStatus, do not change value or metadata values
-            prev_status = item.get("currentStatus", "invalid")
+            # Update currentStatus, but history should track the VALUE change
+            old_val = item.get("value", "")
             item["currentStatus"] = "On Hold"
             
             if "history" not in item:
                 item["history"] = []
             item["history"].append({
-                "from": prev_status,
-                "to": "On Hold",
+                "from": old_val,
+                "to": value, # The drafted value
                 "source": "draft",
                 "updatedOn": now_str,
                 "updatedBy": "xxx@amd.com"
             })
             
-            # Cascade currentStatus only to metadata fields
+            # Cascade currentStatus and update value for metadata fields if applicable
             for meta in item.get("metadata", []):
-                prev_meta_status = meta.get("currentStatus", "invalid")
+                old_meta_val = meta.get("value", "")
                 meta["currentStatus"] = "On Hold"
                 
                 if "history" not in meta:
                     meta["history"] = []
                 meta["history"].append({
-                    "from": prev_meta_status,
-                    "to": "On Hold",
+                    "from": old_meta_val,
+                    "to": old_meta_val, # Keep value, just status changed
                     "source": "draft",
                     "updatedOn": now_str,
                     "updatedBy": "xxx@amd.com"
@@ -1710,6 +1730,13 @@ async def create_masterlist_draft(type_name: str, draft: DraftRecordRequest):
         
         snap_data["standardization_status"] = "On Hold"
         snap_data["reason"] = "New Masterlist Draft Record."
+        
+        # Update Top-level History (Preserve for Monitoring)
+        if "history" not in snap_data:
+            snap_data["history"] = {}
+        snap_data["history"]["updatedOn"] = now_str
+        snap_data["history"]["updatedBy"] = "xxx@amd.com"
+        snap_data["history"]["last_action"] = "Placed On Hold (Draft created)"
         
         # Save updated snapshot only
         await db[SNAPSHOT_COL].replace_one({"_id": snap["_id"]}, snap)
