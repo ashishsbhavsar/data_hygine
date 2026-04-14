@@ -3,7 +3,7 @@ import rapidfuzz
 from rapidfuzz import process, fuzz
 from typing import Dict, Any, Tuple, List, Set, Optional
 from utils import get_nested_value
-from database import get_db
+from database import get_db, MASTERLIST_COL, PROCESSOR_DETAILS_COL
  
  
 # Conditional validation rules: fields that only apply when sutType matches a condition
@@ -13,8 +13,7 @@ CONDITIONAL_RULES = {
     "CPUModel": {"field": "sutInstanceMetadata.sutType", "condition": "not_equals", "value": "cloud"},
     "instanceType": {"field": "sutInstanceMetadata.sutType", "condition": "equals", "value": "cloud"}
 }
- 
- 
+
 async def build_mappings() -> Dict[str, str]:
     """
     Dynamically builds the MAPPINGS dict from the masterlist collection.
@@ -30,7 +29,7 @@ async def build_mappings() -> Dict[str, str]:
         }}
     ]
     mappings = {}
-    async for doc in db['masterlist'].aggregate(pipeline):
+    async for doc in db[MASTERLIST_COL].aggregate(pipeline):
         ml_type = doc["_id"]
         mapping_path = doc.get("mapping")
        
@@ -39,7 +38,7 @@ async def build_mappings() -> Dict[str, str]:
  
     # 2. Discover metadata-level mappings (e.g., BenchmarkType mapping inside Benchmark)
     # This allows the API to see them as distinct parameters even if they're embedded.
-    cursor = db['masterlist'].find({"status": "Published", "data.metadata": {"$exists": True}})
+    cursor = db[MASTERLIST_COL].find({"status": "Published", "data.metadata": {"$exists": True}})
     async for doc in cursor:
         meta = doc.get("data", {}).get("metadata", {})
         if not isinstance(meta, dict):
@@ -49,26 +48,26 @@ async def build_mappings() -> Dict[str, str]:
             param_name = k
             if k.startswith("mapping_"):
                 param_name = k.replace("mapping_", "")
-            
+           
             # Standardization of dash labels
             if param_name.lower() == "benchmarktype":
                 param_name = "BenchmarkType"
             if param_name.lower() == "cloudprovider":
                 param_name = "cloudProvider"
-                
-            # If it's a mapping path, always update it to ensure we get the truth.
-            # If it's just a field name, only add it if we don't have a path yet.
-            if k.startswith("mapping_"):
-                mappings[param_name] = str(v)
-            elif param_name not in mappings:
-                mappings[param_name] = ""
+               
+            if param_name not in mappings:
+                # Store the value as the path if it started with mapping_
+                mappings[param_name] = str(v) if k.startswith("mapping_") else ""
    
     return mappings
  
  
 class Validator:
-    def __init__(self, ml_records, mappings: Dict[str, str]):
+    def __init__(self, ml_records, mappings: Dict[str, str], processor_records: List[Dict] = None):
         self.mappings = mappings
+        self.processor_cache: Dict[str, Dict] = {}
+        if processor_records:
+            self.processor_cache = {str(r.get("cpuModelNo", "")): r for r in processor_records if r.get("cpuModelNo")}
        
         self.valid_values: Dict[str, Set[str]] = {t: set() for t in mappings}
         self.value_ids: Dict[str, Dict[str, str]] = {t: {} for t in mappings}
@@ -76,6 +75,7 @@ class Validator:
         self.val_metadata_reqs: Dict[str, Dict[str, List[Dict]]] = {t: {} for t in mappings}
         self.all_metadata_values: Dict[str, Dict[str, str]] = {}
         self.type_metadata_paths: Dict[str, Dict[str, str]] = {t: {} for t in mappings}
+        self.suggestion_cache: Dict[str, Dict[str, List[Dict]]] = {t: {} for t in mappings}
        
         # Track which types are primary (explicitly defined in masterlist as type)
         self.primary_types: Set[str] = set()
@@ -129,7 +129,7 @@ class Validator:
                         meta_mapping_path = meta.get("mapping", "")
                    
                     mv_str = str(mv).strip()
-                    if mv_str and mv_str.lower() not in ["none", "nan", "null"]:
+                    if mv_str:
                         meta_record[mk] = {"mapping": meta_mapping_path, "required_val": mv_str}
                         signature_parts.append(mv_str)
                        
@@ -162,7 +162,7 @@ class Validator:
         if not possibilities or not value:
             return []
        
-        matches = process.extract(value, possibilities, limit=n, scorer=fuzz.partial_ratio, score_cutoff=70)
+        matches = process.extract(value, possibilities, limit=n, scorer=fuzz.partial_ratio, score_cutoff=10)
         results = []
         for i, match_info in enumerate(matches, 1):
             match, score, _ = match_info
@@ -197,23 +197,21 @@ class Validator:
         actual_signature_parts = [str(value).strip()]
         for m_name in sorted(actual_metadata.keys()):
             m_val = str(actual_metadata.get(m_name, "")).strip()
-            if m_val and m_val.lower() not in ["none", "nan", "null"]:
+            if m_val and m_val.lower() != "nan":
                 actual_signature_parts.append(m_val)
         
         actual_signature = " ".join(actual_signature_parts).lower()
         
-        # 1b. CLEAN QUERY: Remove generic terms to allow fuzzy matching to focus on unique IDs
-        # (e.g., 'AMD EPYC-Genoa Processor' -> 'genoa')
-        actual_signature = re.sub(r'\b(amd|epyc|processor|cpu|series)\b', '', actual_signature, flags=re.IGNORECASE)
-        actual_signature = re.sub(r'[^a-z0-9]', ' ', actual_signature, flags=re.IGNORECASE)
-        actual_signature = " ".join(actual_signature.split()).lower()
+        # 1.5 CHECK CACHE
+        if actual_signature in self.suggestion_cache[field_type]:
+            return self.suggestion_cache[field_type][actual_signature]
         
         # 2. Extract signatures for matching
         signature_strings = [c["signature"] for c in type_configs]
         
         # 3. Perform Fuzzy Search using partial_ratio on Mega-Strings
         # This handles noisy names effectively by prioritizing metadata overlaps
-        matches = process.extract(actual_signature, signature_strings, limit=n, scorer=fuzz.partial_ratio, score_cutoff=70)
+        matches = process.extract(actual_signature, signature_strings, limit=n, scorer=fuzz.partial_ratio, score_cutoff=75)
         
         results = []
         for match_str, score, index in matches:
@@ -224,9 +222,168 @@ class Validator:
                 "metadata": config["metadata"],
                 "score": round(score / 100.0, 4)
             })
+        
+        # 4. SAVE TO CACHE
+        self.suggestion_cache[field_type][actual_signature] = results
             
         return results
  
+    def validate_doc_sync(self, doc: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+        """Synchronous version of validation for high-performance multiprocessing."""
+        # 1. Extract values for each mapped field
+        field_values: Dict[str, str] = {}
+        for t, path in self.mappings.items():
+            field_values[t] = str(get_nested_value(doc, path) or '').strip()
+       
+        # 2. Determine which fields should be validated based on conditional rules
+        should_validate: Dict[str, bool] = {}
+        for t in self.mappings:
+            if t in CONDITIONAL_RULES:
+                rule = CONDITIONAL_RULES[t]
+                condition_val = str(get_nested_value(doc, rule["field"]) or '').strip().lower()
+                if rule["condition"] == "equals":
+                    should_validate[t] = (condition_val == rule["value"])
+                elif rule["condition"] == "not_equals":
+                    should_validate[t] = (condition_val != rule["value"])
+                else:
+                    should_validate[t] = True
+            else:
+                should_validate[t] = True
+       
+        # 3. Basic validation: valid or invalid only
+        field_status: Dict[str, str] = {}
+        param_flags: Dict[str, bool] = {}
+       
+        for t in self.mappings:
+            if t not in self.primary_types:
+                continue # Skip metadata fields from top-level validation
+               
+            val = field_values[t]
+            is_empty = (val == "" or val == "nan")
+           
+            if not should_validate[t]:
+                field_status[t] = "valid"
+                param_flags[t] = False
+                continue
+           
+            if is_empty or val not in self.valid_values.get(t, set()):
+                field_status[t] = "invalid"
+                param_flags[t] = True
+            else:
+                field_status[t] = "valid"
+                param_flags[t] = False
+       
+        # 5. Construct invalid payload
+        invalid_payload = []
+        for t in self.mappings:
+            if t not in self.primary_types:
+                continue # Skip metadata fields from top-level loop
+               
+            val = field_values[t]
+            is_empty = (val == "" or val == "nan")
+           
+            t_metadata = []
+            has_metadata_mismatch = False
+           
+            overall_field_status = field_status.get(t, "valid")
+            primary_validation_status = "valid" if not param_flags.get(t, False) else "invalid"
+           
+            if not param_flags.get(t, False) and should_validate.get(t, True) and not is_empty:
+                possible_configs = self.val_metadata_reqs.get(t, {}).get(val, [])
+               
+                if possible_configs:
+                    best_config_metadata = []
+                    min_errors = 999
+                    perfect_match_found = False
+                   
+                    for record_id, config in possible_configs:
+                        current_config_metadata = []
+                        current_errors = 0
+                       
+                        for m_name, m_info in config.items():
+                            m_path = m_info.get("mapping", "")
+                            m_required_val = m_info.get("required_val", "")
+                           
+                            m_val = ""
+                            if m_path.startswith("processor_details."):
+                                target_field = m_path.split(".", 1)[1]
+                                cpu_model_val = field_values.get("CPUModel", "")
+                                if cpu_model_val:
+                                    # USE CACHE INSTEAD OF DB CALL
+                                    proc_doc = self.processor_cache.get(cpu_model_val)
+                                    if proc_doc:
+                                        m_val = str(proc_doc.get(target_field, "")).strip()
+                            else:
+                                m_val = str(get_nested_value(doc, m_path) or '').strip() if m_path else ""
+                           
+                            m_is_empty = (m_val == "" or m_val == "nan")
+                            if m_is_empty:
+                                m_status = "invalid"
+                                current_errors += 1
+                            elif m_val != m_required_val:
+                                m_status = "invalid"
+                                current_errors += 1
+                            else:
+                                m_status = "valid"
+                           
+                            current_config_metadata.append({
+                                "name": m_name,
+                                "value": m_val,
+                                "validation_status": m_status,
+                                "mapping": m_path
+                            })
+                       
+                        if current_errors == 0:
+                            t_metadata = current_config_metadata
+                            perfect_match_found = True
+                            break
+                       
+                        if current_errors < min_errors:
+                            min_errors = current_errors
+                            best_config_metadata = current_config_metadata
+                   
+                    if not perfect_match_found:
+                        t_metadata = best_config_metadata
+                        has_metadata_mismatch = True
+                        overall_field_status = "invalid"
+           
+            elif param_flags.get(t, False) and should_validate.get(t, True) and not is_empty:
+                schema_reqs = self.type_metadata_paths.get(t, {})
+                for m_name, m_path in schema_reqs.items():
+                    m_val = ""
+                    if m_path.startswith("processor_details."):
+                        target_field = m_path.split(".", 1)[1]
+                        cpu_model_val = field_values.get("CPUModel", "")
+                       
+                        if cpu_model_val:
+                            # USE CACHE
+                            proc_doc = self.processor_cache.get(cpu_model_val)
+                            if proc_doc:
+                                m_val = str(proc_doc.get(target_field, "")).strip()
+                    else:
+                        m_val = str(get_nested_value(doc, m_path) or '').strip() if m_path else ""
+                       
+                    m_is_empty = (m_val == "" or m_val == "nan")
+                    m_status = "invalid"
+                   
+                    t_metadata.append({
+                        "name": m_name,
+                        "value": m_val,
+                        "validation_status": m_status,
+                        "mapping": m_path
+                    })
+           
+            if overall_field_status == "invalid":
+                invalid_payload.append({
+                    "field": t,
+                    "value": val,
+                    "validation_status": primary_validation_status,
+                    "mapping": self.mappings.get(t, ""),
+                    "metadata": t_metadata
+                })
+       
+        return invalid_payload, field_status
+
     async def validate_doc(self, db, doc: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
         # 1. Extract values for each mapped field
         field_values: Dict[str, str] = {}
@@ -315,17 +472,11 @@ class Validator:
                            
                             m_is_empty = (m_val == "" or m_val == "nan")
                             if m_is_empty:
-                                # We treat missing metadata as a 'warning' rather than a hard fail for the CROSS-FIELD logic
-                                # unless the masterlist specifically requires a non-empty value (which it usually does).
-                                # However, to avoid 'All are Invalid' status on legacy data, we relax this.
-                                m_status = "invalid" 
-                                # OPTION: Don't increment current_errors for empty values if you want a softer validation
-                                # current_errors += 1 
+                                m_status = "invalid"
+                                current_errors += 1
                             elif m_val != m_required_val:
                                 m_status = "invalid"
-                                # We treat metadata mismatches as informational for now to avoid 'All are Invalid'
-                                # unless the user explicitly wants strict cross-field enforcement.
-                                # current_errors += 1
+                                current_errors += 1
                             else:
                                 m_status = "valid"
                            
@@ -333,8 +484,7 @@ class Validator:
                                 "name": m_name,
                                 "value": m_val,
                                 "validation_status": m_status,
-                                "mapping": m_path,
-                                "history": []
+                                "mapping": m_path
                             })
                        
                         if current_errors == 0:
@@ -373,19 +523,16 @@ class Validator:
                         "name": m_name,
                         "value": m_val,
                         "validation_status": m_status,
-                        "mapping": m_path,
-                        "history": []
+                        "mapping": m_path
                     })
            
             if overall_field_status == "invalid":
                 invalid_payload.append({
                     "field": t,
-                    "currentStatus": "invalid",
                     "value": val,
                     "validation_status": primary_validation_status,
                     "mapping": self.mappings.get(t, ""),
-                    "metadata": t_metadata,
-                    "history": []
+                    "metadata": t_metadata
                 })
        
         return invalid_payload, field_status
@@ -393,5 +540,6 @@ class Validator:
 async def get_validator() -> Validator:
     db = get_db()
     mappings = await build_mappings()
-    ml_records = await db['masterlist'].find({"status": "Published"}).to_list(length=None)
-    return Validator(ml_records, mappings)
+    ml_records = await db[MASTERLIST_COL].find({"status": "Published"}).to_list(length=None)
+    processor_records = await db[PROCESSOR_DETAILS_COL].find({}).to_list(length=None)
+    return Validator(ml_records, mappings, processor_records)
