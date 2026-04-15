@@ -32,7 +32,6 @@ async def process_document(db, validator, doc):
         invalid_payload, field_status = await validator.validate_doc(db, doc)
         is_val = len(invalid_payload) == 0
  
-        # 2. Update Source Collection (execuationinfo) with results
         await db[EXECUTION_INFO_COL].update_one(
             {"_id": doc["_id"]},
             {"$set": {
@@ -43,7 +42,7 @@ async def process_document(db, validator, doc):
                 "validatedAt": datetime.now(timezone.utc).isoformat()
             }}
         )
-        logger.info(f"Validation complete for: {exec_id} (Result: {'Valid' if is_val else 'Invalid'})")
+        logger.info(f"Successfully processed specific record: {exec_id} | Status: {'Valid' if is_val else 'Invalid'}")
  
     except Exception as e:
         logger.error(f"Error processing document {doc.get('_id')}: {str(e)}")
@@ -86,7 +85,16 @@ async def run_trigger():
     # Try Change Stream first
     try:
         logger.info(f"Attempting to start Change Stream on: {EXECUTION_INFO_COL}")
-        async with collection.watch([{"$match": {"operationType": {"$in": ["insert", "replace", "update"]}}}], full_document="updateLookup") as stream:
+        
+        # Match only inserts/updates where the document hasn't been validated yet
+        pipeline = [
+            {"$match": {
+                "operationType": {"$in": ["insert", "replace", "update"]},
+                "fullDocument.validated": {"$exists": False}
+            }}
+        ]
+        
+        async with collection.watch(pipeline, full_document="updateLookup") as stream:
             async for change in stream:
                 doc = change.get("fullDocument")
                 if doc:
@@ -95,7 +103,7 @@ async def run_trigger():
         err_msg = str(e)
         if isinstance(e, OperationFailure) and e.code == 40573 or "not support change streams" in err_msg.lower():
             logger.warning("Change Streams not supported (Standalone MongoDB detected). Switching to Polling Fallback.")
-            await run_polling(db, validator, collection_name)
+            await run_polling(db, validator, EXECUTION_INFO_COL)
         else:
             logger.error(f"MongoDB error: {err_msg}")
             logger.info("Restarting trigger in 5 seconds...")
