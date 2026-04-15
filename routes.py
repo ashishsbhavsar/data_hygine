@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Query, Body, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import time
@@ -12,11 +13,14 @@ from utils import get_nested_value, get_metadata_schema
 
 router = APIRouter()
 
+
+
 class ApproveSuggestionRequest(BaseModel):
     execution_id: str
     field_name: str
     accepted_value: str
     currentStatus: str = "Accepted"
+    coreCount: Optional[str] = None
 
 class RejectRecordRequest(BaseModel):
     execution_id: str
@@ -33,10 +37,14 @@ class DraftRecordRequest(BaseModel):
     cloudprovider: Optional[str] = ""
     benchmarktype: Optional[str] = ""
 
-# Internal Helpers for Draft Workflows
-async def _check_duplicate(db, type_name, value):
-    """Checks if a record with the same type and value already exists in the masterlist."""
-    return await db[MASTERLIST_COL].find_one({"type": type_name, "data.value": value})
+async def _check_duplicate(db, type_name, value, metadata_dict=None):
+    """Checks if a record with the same type, value, and precise metadata already exists in the masterlist."""
+    query = {"type": type_name, "data.value": value}
+    if metadata_dict:
+        for k, v in metadata_dict.items():
+            if v is not None and v != "":
+                query[f"data.metadata.{k}"] = str(v)
+    return await db[MASTERLIST_COL].find_one(query)
 
 def _build_base_ml_doc(type_name, data_content, updated_by: str = ""):
     """Builds the common base structure for a 'In Review' masterlist document with data before history."""
@@ -191,7 +199,16 @@ async def get_invalid_records(
     invalid_records = []
     async for doc in db[EXECUTION_INFO_COL].aggregate(pipeline):
         invalid_payloads = doc.get("invalidPayload", [])
-        invalid_fields = [p.get("field") for p in invalid_payloads if p.get("field")]
+        
+        # Traverse top level payload and metadata to collect ALL invalid fields dynamically
+        invalid_fields_set = set()
+        for p in invalid_payloads:
+            if p.get("validation_status") == "invalid" and p.get("field"):
+                invalid_fields_set.add(p["field"])
+            for m in p.get("metadata", []):
+                if m.get("validation_status") == "invalid" and m.get("name"):
+                    invalid_fields_set.add(m["name"])
+        invalid_fields = sorted(list(invalid_fields_set))
         
         record = {
             "ExecutionId": doc["_id"],
@@ -270,11 +287,11 @@ async def get_invalid_summary_counts():
         try:
             # Parse the timestamp e.g. '2026-03-27T15:18:14.632228Z'
             dt = datetime.strptime(updated_on_str, "%Y-%m-%dT%H:%M:%S.%fZ")
-            delta_days = (now - dt).days
+            delta_days = (now - dt).total_seconds() / 86400.0
             
             if delta_days < 3:
                 counts["green"] += 1
-            elif 3 <= delta_days <= 6:
+            elif delta_days <= 6:
                 counts["yellow"] += 1
             else:
                 counts["red"] += 1
@@ -299,14 +316,17 @@ async def get_invalid_summary(
     """
     db = get_db()
     
+    import re
     # 1. Primary Filter on Snapshot collection
     if status:
-        status_filter = status.upper()
-        match_query = {"data.standardization_status": {"$regex": f"^{status_filter}$", "$options": "i"}}
+        status_list = [s.strip() for s in status.split(",") if s.strip()]
+        regex_pattern = "^(" + "|".join(re.escape(s) for s in status_list) + ")$"
+        status_filter = ",".join(status_list).upper()
+        match_query = {"data.standardization_status": {"$regex": regex_pattern, "$options": "i"}}
     else:
         # Default: Include all high-level statuses
         status_filter = "ALL"
-        match_query = {"data.standardization_status": {"$in": ["PENDING", "REJECTED", "ON HOLD", "ACCEPTED"]}}
+        match_query = {"data.standardization_status": {"$regex": "^(PENDING|REJECTED|ON HOLD|ACCEPTED)$", "$options": "i"}}
     
     print(f"API Executing Match Query: {match_query}")
     
@@ -417,9 +437,7 @@ async def get_invalid_summary(
             {"$match": {"dt": {"$ne": None}}},
             {"$addFields": {
                 "diffDays": {
-                    "$floor": {
-                        "$divide": [{"$subtract": ["$now", "$dt"]}, 86400000]
-                    }
+                    "$divide": [{"$subtract": ["$now", "$dt"]}, 86400000]
                 }
             }},
             {"$group": {
@@ -575,8 +593,8 @@ async def get_validation_counts():
         facet_dict[t] = [
             {"$group": {
                 "_id": None,
-                "valid":   {"$sum": {"$cond": [{"$in": [t, "$invalidPayload.field"]}, 0, 1]}},
-                "invalid": {"$sum": {"$cond": [{"$in": [t, "$invalidPayload.field"]}, 1, 0]}},
+                "valid":   {"$sum": {"$cond": [{"$in": [t, {"$ifNull": ["$all_invalid_fields", []]}]}, 0, 1]}},
+                "invalid": {"$sum": {"$cond": [{"$in": [t, {"$ifNull": ["$all_invalid_fields", []]}]}, 1, 0]}},
             }}
         ]
         
@@ -586,6 +604,38 @@ async def get_validation_counts():
         {"$group": {
             "_id": "$benchmarkExecutionID",
             "invalidPayload": {"$first": "$invalidPayload"}
+        }},
+        {"$addFields": {
+            "all_invalid_fields": {
+                "$reduce": {
+                    "input": {
+                        "$map": {
+                            "input": {"$ifNull": ["$invalidPayload", []]},
+                            "as": "p",
+                            "in": {
+                                "$concatArrays": [
+                                    {"$cond": [{"$eq": ["$$p.validation_status", "invalid"]}, ["$$p.field"], []]},
+                                    {
+                                        "$map": {
+                                            "input": {
+                                                "$filter": {
+                                                    "input": {"$ifNull": ["$$p.metadata", []]},
+                                                    "as": "m",
+                                                    "cond": {"$eq": ["$$m.validation_status", "invalid"]}
+                                                }
+                                            },
+                                            "as": "m_valid",
+                                            "in": "$$m_valid.name"
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "initialValue": [],
+                    "in": {"$concatArrays": ["$$value", "$$this"]}
+                }
+            }
         }},
         {"$facet": facet_dict}
     ]
@@ -1155,6 +1205,11 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
                     if k.lower() == str(meta_name).lower():
                         meta_accepted_value = v
                         break
+                        
+            # --- CUSTOM OVERRIDE FOR CORECOUNT WHEN EDITABLE ---
+            if meta_name == "coreCount" and getattr(req, "coreCount", None) is not None:
+                meta_accepted_value = req.coreCount
+            # ---------------------------------------------------
             
             # Mark metadata as valid (do NOT update the value field in the snapshot)
             meta_item["validation_status"] = "valid"
@@ -1172,7 +1227,8 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
             cascaded_changes.append({
                 "field": meta_name,
                 "from": meta_original_value,
-                "to": meta_accepted_value or meta_original_value
+                "to": meta_accepted_value or meta_original_value,
+                "source": "manual" if (meta_name == "coreCount" and getattr(req, "coreCount", None) is not None) else value_source
             })
     
     # 5. Check for Overall Validity (Standardization Status)
@@ -1210,7 +1266,7 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
         new_from.append(change["from"])
         new_to.append(change["to"])
         new_field.append(change["field"])
-        new_source.append(value_source)
+        new_source.append(change.get("source", value_source))
 
     snap_data["history"] = {
         "updatedOn": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
@@ -1408,12 +1464,35 @@ async def create_masterlist_draft(type_name: str, draft: DraftRecordRequest):
         raise HTTPException(status_code=400, detail="The 'value' field is required in the request body.")
         
     actual_type = "CPUModel" if type_norm == "cpumodel" else ("instanceType" if type_norm == "instancetype" else type_name)
-    existing = await _check_duplicate(db, actual_type, value)
+    
+    # Extract metadata to check for exact uniqueness
+    metadata_dict = {}
+    if type_norm == "cpumodel":
+        if draft.family: metadata_dict["Family"] = draft.family
+        if draft.corecount: metadata_dict["coreCount"] = draft.corecount
+    elif type_norm == "instancetype":
+        if draft.cpumodel: metadata_dict["CPUModel"] = draft.cpumodel
+        if draft.cloudprovider: metadata_dict["cloudProvider"] = draft.cloudprovider
+        if draft.family: metadata_dict["Family"] = draft.family
+        if draft.corecount: metadata_dict["coreCount"] = draft.corecount
+    elif type_norm == "benchmark":
+        if draft.benchmarktype: metadata_dict["BenchmarkType"] = draft.benchmarktype
+        
+    existing = await _check_duplicate(db, actual_type, value, metadata_dict)
     if existing:
-        return {
-            "status": "error",
-            "message": f"A record for {actual_type} '{value}' already exists in the masterlist (Status: {existing['status']})."
-        }
+        meta_str = ", ".join([f"{k}: '{v}'" for k, v in metadata_dict.items()])
+        msg = f"A record for {actual_type} '{value}'"
+        if meta_str:
+            msg += f" with metadata ({meta_str})"
+        msg += f" already exists in the masterlist (Status: {existing['status']})."
+        
+        return JSONResponse(
+            status_code=409,
+            content={
+                "status": "error",
+                "message": msg
+            }
+        )
         
     # 2. Build type-specific data content
     data_content = {}
@@ -1474,6 +1553,12 @@ async def create_masterlist_draft(type_name: str, draft: DraftRecordRequest):
             data_dict = snap["data"][0]
             data_dict["standardization_status"] = "ON HOLD"
             data_dict["reason"] = "New Masterlist Draft Record."
+            
+            # Update Timestamp in history
+            if "history" not in data_dict or not isinstance(data_dict["history"], dict):
+                data_dict["history"] = {}
+            data_dict["history"]["updatedOn"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            data_dict["history"]["updatedBy"] = "xxx@amd.com"
             
             for item in data_dict.get("invalidValues", []):
                 # Update statuses for the drafted field

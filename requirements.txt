@@ -4,3 +4,5 @@ uvicorn
 motor
 python-dotenv
 rapidfuzz
+scikit-learn
+annoy
