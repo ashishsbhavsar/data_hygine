@@ -810,13 +810,24 @@ async def get_snapshot_records(Execution_id: str):
                     saved_status = saved_sug.get("status", "PENDING")
                     break
 
+            # Calculate individual accuracy scores for each field
+            primary_score = round(rapidfuzz.fuzz.ratio(str(val).lower(), str(sug_val).lower()) / 100.0, 4) if val and sug_val else 0.0
+            
             sug_entry = {
                 field_name.lower(): sug_val,
-                "score": rec_sug.get("score", 0),
+                "score": primary_score,                # Accuracy for this specific field
+                "overall_score": rec_sug.get("score", 0),  # Global ANN match score
                 "status": saved_status
             }
+            
             for m_name, m_val in rec_sug["metadata"].items():
+                input_meta_val = actual_meta_vals.get(m_name, "")
+                meta_field_score = round(rapidfuzz.fuzz.ratio(str(input_meta_val).lower(), str(m_val).lower()) / 100.0, 4) if input_meta_val and m_val else 0.0
+                
                 sug_entry[m_name.lower()] = m_val
+                # Store metadata-specific score if needed by the UI
+                sug_entry[f"{m_name.lower()}_score"] = meta_field_score
+                
             field_suggestions.append(sug_entry)
             
         data_list.append({

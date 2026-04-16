@@ -1,5 +1,6 @@
 import asyncio
 from pymongo import UpdateOne, ReplaceOne, DeleteOne
+from rapidfuzz import fuzz
 from database import get_db, close_db, MASTERLIST_COL, EXECUTION_INFO_COL, SNAPSHOT_COL
 from validation import get_validator, build_mappings
 from utils import get_nested_value
@@ -104,9 +105,14 @@ async def main():
                 # Build formatted suggestions for the dashboard (Suggestion Status = PENDING initially)
                 primary_comparing = []
                 for i, rec_sug in enumerate(record_suggestions, 1):
+                    sug_val = rec_sug["primary_value"]
+                    # Calculate individual field score (normalized to 0-1)
+                    field_score = round(fuzz.ratio(str(val).lower(), str(sug_val).lower()) / 100.0, 4) if val and sug_val else 0.0
+                    
                     primary_comparing.append({
-                        f"suggestion{i}": rec_sug["primary_value"],
-                        f"score{i}": rec_sug["score"],
+                        f"suggestion{i}": sug_val,
+                        f"score{i}": field_score,                # Accuracy for this specific field
+                        f"overall_score{i}": rec_sug["score"],    # Overall Mega-String match score
                         "status": "PENDING",
                         "_id": rec_sug["_id"]
                     })
@@ -118,9 +124,16 @@ async def main():
                     m_comparing = []
                     m_name = m_clean.get("name")
                     for i, rec_sug in enumerate(record_suggestions, 1):
+                        sug_meta_val = rec_sug["metadata"].get(m_name, "")
+                        input_meta_val = actual_meta_vals.get(m_name, "")
+                        
+                        # Calculate individual metadata field score
+                        field_score = round(fuzz.ratio(str(input_meta_val).lower(), str(sug_meta_val).lower()) / 100.0, 4) if input_meta_val and sug_meta_val else 0.0
+                        
                         m_comparing.append({
-                            f"suggestion{i}": rec_sug["metadata"].get(m_name, ""),
-                            f"score{i}": rec_sug["score"],
+                            f"suggestion{i}": sug_meta_val,
+                            f"score{i}": field_score,                # Accuracy for this specific metadata field
+                            f"overall_score{i}": rec_sug["score"],    # Overall Mega-String match score
                             "status": "PENDING",
                             "_id": rec_sug["_id"]
                         })
