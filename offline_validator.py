@@ -1,6 +1,6 @@
 import asyncio
 from pymongo import UpdateOne, ReplaceOne, DeleteOne
-from database import get_db, close_db
+from database import get_db, close_db, MASTERLIST_COL, EXECUTION_INFO_COL, SNAPSHOT_COL
 from validation import get_validator, build_mappings
 from utils import get_nested_value
 import uuid
@@ -17,7 +17,7 @@ async def main():
     print(f"Discovered {len(mappings)} validation parameters: {list(mappings.keys())}")
    
     # Optimize performance with explicit sorting
-    cursor = db['Executioninfo'].find({}).sort("_id", 1)
+    cursor = db[EXECUTION_INFO_COL].find({}).sort("_id", 1)
    
     print("Starting offline validation batch processing using advanced cross-field relations...")
     print("Status preservation is now real-time to avoid race conditions.")
@@ -50,7 +50,7 @@ async def main():
             total_invalid += 1
             
         # 2. Handle Snapshot Logic (Transition or Update)
-        latest_snap = await db['snapshot'].find_one(
+        latest_snap = await db[SNAPSHOT_COL].find_one(
             {"execution_id": exec_id},
             {"data": {"$slice": 1}, "snapshot_id": 1}
         )
@@ -156,19 +156,19 @@ async def main():
             ))
        
         if len(updates) >= batch_size:
-            await db['Executioninfo'].bulk_write(updates, ordered=False)
+            await db[EXECUTION_INFO_COL].bulk_write(updates, ordered=False)
             if snapshot_items:
-                await db['snapshot'].bulk_write(snapshot_items, ordered=False)
+                await db[SNAPSHOT_COL].bulk_write(snapshot_items, ordered=False)
                 snapshot_items.clear()
             processed += len(updates)
             print(f"Processed {processed} records... (Valid: {total_valid}, Invalid: {total_invalid})")
             updates.clear()
            
     if updates:
-        await db['Executioninfo'].bulk_write(updates, ordered=False)
+        await db[EXECUTION_INFO_COL].bulk_write(updates, ordered=False)
         processed += len(updates)
     if snapshot_items:
-        await db['snapshot'].bulk_write(snapshot_items, ordered=False)
+        await db[SNAPSHOT_COL].bulk_write(snapshot_items, ordered=False)
                
     print(f"\nOffline Validation Complete! Total: {processed}")
     close_db()

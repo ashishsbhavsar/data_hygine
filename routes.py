@@ -802,7 +802,7 @@ async def get_snapshot_records(Execution_id: str):
         for rec_sug in record_suggestions:
             sug_val = rec_sug["primary_value"]
             saved_status = "PENDING"
-            
+                
             # Find the saved status for this suggestion from the DB
             for saved_sug in saved_comparing:
                 match_val = next((v for k, v in saved_sug.items() if k.startswith("suggestion")), None)

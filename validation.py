@@ -5,7 +5,7 @@ import numpy as np
 from rapidfuzz import process, fuzz
 from typing import Dict, Any, Tuple, List, Set, Optional
 from utils import get_nested_value
-from database import get_db
+from database import get_db, MASTERLIST_COL
 
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -38,7 +38,7 @@ async def build_mappings() -> Dict[str, str]:
         }}
     ]
     mappings = {}
-    async for doc in db['masterlist'].aggregate(pipeline):
+    async for doc in db[MASTERLIST_COL].aggregate(pipeline):
         ml_type = doc["_id"]
         mapping_path = doc.get("mapping")
        
@@ -47,7 +47,7 @@ async def build_mappings() -> Dict[str, str]:
  
     # 2. Discover metadata-level mappings (e.g., BenchmarkType mapping inside Benchmark)
     # This allows the API to see them as distinct parameters even if they're embedded.
-    cursor = db['masterlist'].find({"status": "Published", "data.metadata": {"$exists": True}})
+    cursor = db[MASTERLIST_COL].find({"status": "Published", "data.metadata": {"$exists": True}})
     async for doc in cursor:
         meta = doc.get("data", {}).get("metadata", {})
         if not isinstance(meta, dict):
@@ -512,5 +512,5 @@ class Validator:
 async def get_validator() -> Validator:
     db = get_db()
     mappings = await build_mappings()
-    ml_records = await db['masterlist'].find({"status": "Published"}).to_list(length=None)
+    ml_records = await db[MASTERLIST_COL].find({"status": "Published"}).to_list(length=None)
     return Validator(ml_records, mappings)
