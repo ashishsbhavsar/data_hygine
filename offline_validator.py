@@ -98,8 +98,8 @@ async def main():
                 }
                 actual_meta_vals = {m["name"]: m.get("value", "") for m in p.get("metadata", []) if m.get("name")}
                 
-                # Get record-level suggestions using the new 'Mega-String' logic
-                record_suggestions = validator.get_record_level_suggestions(field, val, actual_meta_vals)
+                # Get record-level suggestions using the new 'Mega-String' logic with ANN
+                record_suggestions = await validator.get_record_level_suggestions_ann(field, val, actual_meta_vals)
                 
                 # Build formatted suggestions for the dashboard (Suggestion Status = PENDING initially)
                 primary_comparing = []

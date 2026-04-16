@@ -792,9 +792,9 @@ async def get_snapshot_records(Execution_id: str):
                 "validation_status": support.get("validation_status")
             })
             
-        # 2. Build suggestions for this field (grouped by masterlist record)
+        # 2. Build suggestions for this field (grouped by masterlist record using ANN)
         actual_meta_vals = {s.get("name"): s.get("value", "") for s in meta.get("metadata", []) if s.get("name")}
-        record_suggestions = validator.get_record_level_suggestions(field_name, val, actual_meta_vals)
+        record_suggestions = await validator.get_record_level_suggestions_ann(field_name, val, actual_meta_vals)
         
         saved_comparing = meta.get("comparingData", [])
         
