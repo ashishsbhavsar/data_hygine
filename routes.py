@@ -763,18 +763,11 @@ async def get_snapshot_records(Execution_id: str):
             # so the UI can fetch and display the full history of this Accepted record!
             
     # Fetch mapping and validation details dynamically for EACH individual field
-    type_mappings = {}
-    data_list = []
+    invalid_fields = item.get("invalidValues", [])
     
     # Process each invalid primary field from the snapshot record
-    for meta in item.get("invalidValues", []):
+    async def process_invalid_field(meta):
         field_name = meta.get("field")
-        if not field_name:
-            continue
-            
-        if field_name not in type_mappings:
-            type_mappings[field_name] = await get_masterlist_mappings(field_name)
-            
         val = meta.get("value")
         
         # 1. Build existing_data for this field (primary field + metadata)
@@ -830,12 +823,15 @@ async def get_snapshot_records(Execution_id: str):
                 
             field_suggestions.append(sug_entry)
             
-        data_list.append({
+        return {
             "invalid_field": field_name,
             "currentStatus": meta.get("currentStatus", "invalid"),
             "existing_data": field_existing_data,
             "suggestions": field_suggestions
-        })
+        }
+
+    # Parallelize all field lookups for this record
+    data_list = await asyncio.gather(*[process_invalid_field(meta) for meta in invalid_fields])
     
     # Restructure history into changes array
     raw_history = item.get("history", {})

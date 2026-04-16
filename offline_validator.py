@@ -85,8 +85,8 @@ async def main():
             raw_status = prev_data.get("standardization_status", "PENDING")
             status_val = raw_status.upper() if raw_status else "PENDING"
             
-            clean_meta = []
-            for p in invalid_payload:
+            # NEW: Parallel Suggestion Processing for all invalid fields in this record
+            async def process_field_suggestions(p):
                 field = p.get("field")
                 val = p.get("value")
                 
@@ -102,17 +102,16 @@ async def main():
                 # Get record-level suggestions using the new 'Mega-String' logic with ANN
                 record_suggestions = await validator.get_record_level_suggestions_ann(field, val, actual_meta_vals)
                 
-                # Build formatted suggestions for the dashboard (Suggestion Status = PENDING initially)
+                # Build formatted suggestions for the dashboard
                 primary_comparing = []
                 for i, rec_sug in enumerate(record_suggestions, 1):
                     sug_val = rec_sug["primary_value"]
-                    # Calculate individual field score (normalized to 0-1)
                     field_score = round(fuzz.ratio(str(val).lower(), str(sug_val).lower()) / 100.0, 4) if val and sug_val else 0.0
                     
                     primary_comparing.append({
                         f"suggestion{i}": sug_val,
-                        f"score{i}": field_score,                # Accuracy for this specific field
-                        f"overall_score{i}": rec_sug["score"],    # Overall Mega-String match score
+                        f"score{i}": field_score,
+                        f"overall_score{i}": rec_sug["score"],
                         "status": "PENDING",
                         "_id": rec_sug["_id"]
                     })
@@ -126,21 +125,22 @@ async def main():
                     for i, rec_sug in enumerate(record_suggestions, 1):
                         sug_meta_val = rec_sug["metadata"].get(m_name, "")
                         input_meta_val = actual_meta_vals.get(m_name, "")
-                        
-                        # Calculate individual metadata field score
                         field_score = round(fuzz.ratio(str(input_meta_val).lower(), str(sug_meta_val).lower()) / 100.0, 4) if input_meta_val and sug_meta_val else 0.0
                         
                         m_comparing.append({
                             f"suggestion{i}": sug_meta_val,
-                            f"score{i}": field_score,                # Accuracy for this specific metadata field
-                            f"overall_score{i}": rec_sug["score"],    # Overall Mega-String match score
+                            f"score{i}": field_score,
+                            f"overall_score{i}": rec_sug["score"],
                             "status": "PENDING",
                             "_id": rec_sug["_id"]
                         })
                     m_clean["comparingData"] = m_comparing
                     meta_list.append(m_clean)
                 p_clean["metadata"] = meta_list
-                clean_meta.append(p_clean)
+                return p_clean
+
+            # Run all field suggestions in parallel for this document
+            clean_meta = await asyncio.gather(*[process_field_suggestions(p) for p in invalid_payload])
             
             snapshot_doc = {
                 "snapshot_id": snap_id,

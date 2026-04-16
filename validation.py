@@ -1,6 +1,7 @@
 import re
 import rapidfuzz
 import asyncio
+import concurrent.futures
 import numpy as np
 from rapidfuzz import process, fuzz
 from typing import Dict, Any, Tuple, List, Set, Optional
@@ -163,51 +164,57 @@ class Validator:
             self._build_ann_indexes()
 
     def _build_ann_indexes(self):
-        """Builds TF-IDF vectorizers and NearestNeighbors indexes for each field type."""
-        for t in self.mappings:
-            possibilities = list(self.valid_values.get(t, set()))
-            if not possibilities:
-                possibilities = list(self.all_metadata_values.get(t, {}).keys())
-            
-            if possibilities:
+        """Builds TF-IDF vectorizers and NearestNeighbors indexes in parallel."""
+        if not HAS_SKLEARN:
+            return
+
+        def _fit_index(key, items, is_signature=False, configs=None):
+            if not items:
+                return None
+            try:
                 vectorizer = TfidfVectorizer(analyzer='char', ngram_range=(2, 4))
-                try:
-                    tfidf_matrix = vectorizer.fit_transform(possibilities)
-                    # Use brute force for small datasets, but BallTree/KDTree for larger ones
-                    # Brute with cosine metric is good for TF-IDF
-                    nn = NearestNeighbors(n_neighbors=5, metric='cosine', algorithm='brute')
-                    nn.fit(tfidf_matrix)
-                    self._ann_indexes[t] = {
-                        "vectorizer": vectorizer,
-                        "nn": nn,
-                        "possibilities": possibilities
-                    }
-                except Exception:
-                    pass
-        
-        # Also build index for record-level signatures
-        for t, configs in self.record_signatures.items():
-            signatures = [c["signature"] for c in configs]
-            if signatures:
-                vectorizer = TfidfVectorizer(analyzer='char', ngram_range=(2, 4))
-                try:
-                    tfidf_matrix = vectorizer.fit_transform(signatures)
-                    nn = NearestNeighbors(n_neighbors=5, metric='cosine', algorithm='brute')
-                    nn.fit(tfidf_matrix)
-                    self._ann_indexes[f"{t}_signatures"] = {
-                        "vectorizer": vectorizer,
-                        "nn": nn,
-                        "configs": configs
-                    }
-                except Exception:
-                    pass
+                tfidf_matrix = vectorizer.fit_transform(items)
+                nn = NearestNeighbors(n_neighbors=5, metric='cosine', algorithm='brute')
+                nn.fit(tfidf_matrix)
+                
+                result = {
+                    "vectorizer": vectorizer,
+                    "nn": nn,
+                }
+                if is_signature:
+                    result["configs"] = configs
+                else:
+                    result["possibilities"] = items
+                return key, result
+            except Exception:
+                return None
+
+        tasks = []
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            # 1. Field-level indexes
+            for t in self.mappings:
+                possibilities = list(self.valid_values.get(t, set()))
+                if not possibilities:
+                    possibilities = list(self.all_metadata_values.get(t, {}).keys())
+                tasks.append(executor.submit(_fit_index, t, possibilities))
+
+            # 2. Record-level signature indexes
+            for t, configs in self.record_signatures.items():
+                signatures = [c["signature"] for c in configs]
+                tasks.append(executor.submit(_fit_index, f"{t}_signatures", signatures, True, configs))
+
+            # Collect results
+            for future in concurrent.futures.as_completed(tasks):
+                res = future.result()
+                if res:
+                    key, data = res
+                    self._ann_indexes[key] = data
  
     def get_suggestions(self, field_type: str, value: str, n: int = 3) -> List[Dict[str, Any]]:
-        is_metadata = False
+        is_metadata = field_type not in self.primary_types
         possibilities = list(self.valid_values.get(field_type, set()))
-        if not possibilities:
+        if not possibilities and is_metadata:
             possibilities = list(self.all_metadata_values.get(field_type, {}).keys())
-            is_metadata = True
            
         if not possibilities or not value:
             return []
@@ -251,7 +258,7 @@ class Validator:
         # Run CPU-bound search in a thread to keep FastAPI responsive
         distances, indices = await asyncio.to_thread(_search)
         
-        is_metadata = field_type not in self.valid_values
+        is_metadata = field_type not in self.primary_types
         results = []
         for i, (dist, idx) in enumerate(zip(distances, indices), 1):
             match = possibilities[idx]
