@@ -15,6 +15,9 @@ try:
 except ImportError:
     HAS_SKLEARN = False
  
+# Global cache for the validator instance and its initialization lock
+_validator_instance = None
+_validator_lock = asyncio.Lock()
  
 # Conditional validation rules: fields that only apply when sutType matches a condition
 # Format: {masterlist_type: {"condition": "equals"|"not_equals", "value": "cloud"}}
@@ -82,6 +85,10 @@ class Validator:
         self.val_metadata_reqs: Dict[str, Dict[str, List[Dict]]] = {t: {} for t in mappings}
         self.all_metadata_values: Dict[str, Dict[str, str]] = {}
         self.type_metadata_paths: Dict[str, Dict[str, str]] = {t: {} for t in mappings}
+        
+        # Caches for performance optimization
+        self._search_cache: Dict[str, Any] = {}
+        self._processor_cache: Dict[str, Any] = {}
        
         # Track which types are primary (explicitly defined in masterlist as type)
         self.primary_types: Set[str] = set()
@@ -245,6 +252,11 @@ class Validator:
         if not HAS_SKLEARN or field_type not in self._ann_indexes or not value:
             return self.get_suggestions(field_type, value, n)
 
+        # Check search cache
+        cache_key = f"sug:{field_type}:{value}:{n}"
+        if cache_key in self._search_cache:
+            return self._search_cache[cache_key]
+
         index_data = self._ann_indexes[field_type]
         vectorizer = index_data["vectorizer"]
         nn = index_data["nn"]
@@ -276,6 +288,8 @@ class Validator:
                 "status": "PENDING",
                 "_id": match_id
             })
+        
+        self._search_cache[cache_key] = results
         return results
  
     def get_record_level_suggestions(self, field_type: str, value: str, actual_metadata: Dict[str, str] = None, n: int = 3) -> List[Dict[str, Any]]:
@@ -338,6 +352,11 @@ class Validator:
                 actual_signature_parts.append(m_val)
         actual_signature = " ".join(actual_signature_parts).lower()
 
+        # Check search cache
+        cache_key = f"rec:{field_type}:{actual_signature}:{n}"
+        if cache_key in self._search_cache:
+            return self._search_cache[cache_key]
+
         index_data = self._ann_indexes[f"{field_type}_signatures"]
         vectorizer = index_data["vectorizer"]
         nn = index_data["nn"]
@@ -360,7 +379,9 @@ class Validator:
                 "metadata": config["metadata"],
                 "score": round(float(score), 4)
             })
-            
+        
+        # Save to cache before returning
+        self._search_cache[cache_key] = results
         return results
  
     async def validate_doc(self, db, doc: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
@@ -443,7 +464,12 @@ class Validator:
                                 target_field = m_path.split(".", 1)[1]
                                 cpu_model_val = field_values.get("CPUModel", "")
                                 if cpu_model_val:
-                                    proc_doc = await db["processor_details"].find_one({"cpuModelNo": cpu_model_val})
+                                    if cpu_model_val in self._processor_cache:
+                                        proc_doc = self._processor_cache[cpu_model_val]
+                                    else:
+                                        proc_doc = await db["processor_details"].find_one({"cpuModelNo": cpu_model_val})
+                                        self._processor_cache[cpu_model_val] = proc_doc
+                                    
                                     if proc_doc:
                                         m_val = str(proc_doc.get(target_field, "")).strip()
                             else:
@@ -489,7 +515,12 @@ class Validator:
                         cpu_model_val = field_values.get("CPUModel", "")
                        
                         if cpu_model_val:
-                            proc_doc = await db["processor_details"].find_one({"cpuModelNo": cpu_model_val})
+                            if cpu_model_val in self._processor_cache:
+                                proc_doc = self._processor_cache[cpu_model_val]
+                            else:
+                                proc_doc = await db["processor_details"].find_one({"cpuModelNo": cpu_model_val})
+                                self._processor_cache[cpu_model_val] = proc_doc
+                            
                             if proc_doc:
                                 m_val = str(proc_doc.get(target_field, "")).strip()
                     else:
@@ -517,7 +548,11 @@ class Validator:
         return invalid_payload, field_status
  
 async def get_validator() -> Validator:
-    db = get_db()
-    mappings = await build_mappings()
-    ml_records = await db[MASTERLIST_COL].find({"status": "Published"}).to_list(length=None)
-    return Validator(ml_records, mappings)
+    global _validator_instance
+    async with _validator_lock:
+        if _validator_instance is None:
+            db = get_db()
+            mappings = await build_mappings()
+            ml_records = await db[MASTERLIST_COL].find({"status": "Published"}).to_list(length=None)
+            _validator_instance = Validator(ml_records, mappings)
+    return _validator_instance
