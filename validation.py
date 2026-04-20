@@ -1,9 +1,9 @@
-import re
+import time
 import rapidfuzz
 import asyncio
 import concurrent.futures
 import numpy as np
-from rapidfuzz import process, fuzz
+from rapidfuzz import process, fuzz, utils
 from typing import Dict, Any, Tuple, List, Set, Optional
 from utils import get_nested_value
 from database import get_db, MASTERLIST_COL
@@ -16,16 +16,89 @@ except ImportError:
     HAS_SKLEARN = False
  
 # Global cache for the validator instance and its initialization lock
-_validator_instance = None
+_validator_cache = {"instance": None, "updated_at": 0}
+CACHE_TTL = 300  # 5 minutes
 _validator_lock = asyncio.Lock()
  
 # Conditional validation rules: fields that only apply when sutType matches a condition
 # Format: {masterlist_type: {"condition": "equals"|"not_equals", "value": "cloud"}}
 # If a type is NOT listed here, it is validated unconditionally (for all records).
 CONDITIONAL_RULES = {
-    "CPUModel": {"field": "sutInstanceMetadata.sutType", "condition": "not_equals", "value": "cloud"},
     "instanceType": {"field": "sutInstanceMetadata.sutType", "condition": "equals", "value": "cloud"}
 }
+
+async def determine_field_types(db, mappings: Dict[str, str]) -> Dict[str, str]:
+    """
+    Scans ALL records in the ExecutionInfo collection to determine the data type
+    of each mapped field using a SINGLE PASS over the collection.
+   
+    Rules:
+    - Ignore null, None, or empty string values.
+    - For each non-empty value, try to convert it to an integer.
+    - If conversion fails (contains alphabets, special characters, or mixed values
+      like '9654p'), immediately stop checking that field and classify it as 'STRING'.
+    - If ALL non-empty values are successfully converted to integers, classify as 'INTEGER'.
+   
+    Returns: {"CPUModel": "STRING", "coreCount": "INTEGER", ...}
+    """
+    field_types: Dict[str, str] = {}
+   
+    # 1. Resolve actual mapping paths for metadata fields from the masterlist.
+    resolved_paths: Dict[str, str] = dict(mappings)  # Start with existing mappings
+   
+    cursor_ml = db[MASTERLIST_COL].find({"status": "Published", "data.metadata": {"$exists": True}})
+    async for ml_doc in cursor_ml:
+        meta = ml_doc.get("data", {}).get("metadata", {})
+        if not isinstance(meta, dict):
+            continue
+        for k, v in meta.items():
+            if k.startswith("mapping_"):
+                field_name = k.replace("mapping_", "")
+                if field_name in resolved_paths and not resolved_paths[field_name]:
+                    resolved_paths[field_name] = str(v)
+   
+    fields_to_scan: Dict[str, str] = {}
+    for field_name in mappings.keys():
+        mapping_path = resolved_paths.get(field_name, "")
+        if not mapping_path:
+            field_types[field_name] = "STRING"
+        elif mapping_path.startswith("processor_details."):
+            field_types[field_name] = "STRING"
+        else:
+            fields_to_scan[field_name] = mapping_path
+   
+    still_checking: Dict[str, bool] = {f: True for f in fields_to_scan}
+    found_value: Dict[str, bool] = {f: False for f in fields_to_scan}
+   
+    cursor = db['Executioninfo'].find({}, {"_id": 0}).limit(1000)
+    async for doc in cursor:
+        if not still_checking:
+            break
+        for field_name in list(still_checking.keys()):
+            mapping_path = fields_to_scan[field_name]
+            raw_val = get_nested_value(doc, mapping_path)
+            if raw_val is None and mapping_path in doc:
+                raw_val = doc[mapping_path]
+            if raw_val is None:
+                continue
+            str_val = str(raw_val).strip()
+            if str_val == "" or str_val.lower() in ["none", "nan", "null"]:
+                continue
+            found_value[field_name] = True
+            try:
+                int(str_val)
+            except (ValueError, TypeError):
+                still_checking.pop(field_name)
+                field_types[field_name] = "STRING"
+   
+    for field_name in fields_to_scan:
+        if field_name not in field_types:
+            if found_value.get(field_name):
+                field_types[field_name] = "INTEGER"
+            else:
+                field_types[field_name] = "STRING"
+   
+    return field_types
 
 async def build_mappings() -> Dict[str, str]:
     """
@@ -73,11 +146,15 @@ async def build_mappings() -> Dict[str, str]:
                 mappings[param_name] = str(v) if k.startswith("mapping_") else ""
    
     return mappings
+
+# Values that should be ignored when building search signatures
+IGNORED_SIGNATURE_VALUES = {"", "none", "null", "nan", "-", "na", "n/a", "undefined"}
  
  
 class Validator:
-    def __init__(self, ml_records, mappings: Dict[str, str]):
+    def __init__(self, ml_records, mappings: Dict[str, str], field_types: Dict[str, str] = None):
         self.mappings = mappings
+        self.field_types = field_types or {}  # {"coreCount": "INTEGER", "CPUModel": "STRING", ...}
        
         self.valid_values: Dict[str, Set[str]] = {t: set() for t in mappings}
         self.value_ids: Dict[str, Dict[str, str]] = {t: {} for t in mappings}
@@ -88,7 +165,7 @@ class Validator:
         
         # Caches for performance optimization
         self._search_cache: Dict[str, Any] = {}
-        self._processor_cache: Dict[str, Any] = {}
+        self.processor_cache: Dict[str, Dict[str, Any]] = {}
        
         # Track which types are primary (explicitly defined in masterlist as type)
         self.primary_types: Set[str] = set()
@@ -97,31 +174,34 @@ class Validator:
             t = record.get("type")
             data = record.get("data", {})
             val = str(data.get("value", "")).strip()
-           
+            
             if t == "InstanceType":
                 t = "instanceType"
-           
+            
             if not t:
                 continue
-               
+                
             self.primary_types.add(t)
-           
+            
             if t not in self.valid_values:
                 continue
-           
+            
             masterlist_id = str(record.get("`_id`") or record.get("id") or str(record.get("_id", "")))
             if isinstance(masterlist_id, dict) and "$oid" in masterlist_id:
                 masterlist_id = masterlist_id["$oid"]
 
             if val:
-                self.valid_values[t].add(val)
-                self.value_ids[t][val] = masterlist_id
-                if val not in self.val_metadata_reqs[t]:
-                    self.val_metadata_reqs[t][val] = []
-           
+                # Normalize INTEGER-type values to canonical integer string
+                normalized_val = self._normalize_value(t, val)
+                self.valid_values[t].add(normalized_val)
+                self.value_ids[t][normalized_val] = masterlist_id
+                if normalized_val not in self.val_metadata_reqs[t]:
+                    self.val_metadata_reqs[t][normalized_val] = []
+            
             meta_record = {}
             meta = data.get("metadata", {})
-            signature_parts = [val] if val else []
+            normalized_val = self._normalize_value(t, val) if val else val
+            signature_parts = [normalized_val] if normalized_val else []
 
             if isinstance(meta, dict):
                 # We sort metadata keys alphabetically to ensure consistent signature generation
@@ -132,36 +212,40 @@ class Validator:
                     mv = meta[mk]
                     lookup_key = f"mapping_{mk}".lower()
                     meta_mapping_path = None
-                   
+                    
                     for k, v in meta.items():
                         if k.lower() == lookup_key:
                             meta_mapping_path = v
                             break
-                   
+                    
                     if not meta_mapping_path:
                         meta_mapping_path = meta.get("mapping", "")
-                   
+                    
                     mv_str = str(mv).strip()
                     if mv_str:
-                        meta_record[mk] = {"mapping": meta_mapping_path, "required_val": mv_str}
-                        signature_parts.append(mv_str)
-                       
+                        # Normalize metadata values
+                        normalized_mv = self._normalize_value(mk, mv_str)
+                        meta_record[mk] = {"mapping": meta_mapping_path, "required_val": normalized_mv}
+                        signature_parts.append(normalized_mv)
+                        
                         if mk not in self.all_metadata_values:
                             self.all_metadata_values[mk] = {}
-                        self.all_metadata_values[mk][mv_str] = masterlist_id
-                       
+                        self.all_metadata_values[mk][normalized_mv] = masterlist_id
+                        
                         if meta_mapping_path:
                             self.type_metadata_paths[t][mk] = meta_mapping_path
-           
+            
             # Create a Mega-String Signature for this specific configuration
+            # Exclude noise tokens to ensure clean matching
+            signature_parts = [p for p in signature_parts if p.lower() not in IGNORED_SIGNATURE_VALUES]
             full_signature = " ".join(signature_parts).lower()
             
             if val:
-                self.val_metadata_reqs[t][val].append((masterlist_id, meta_record))
+                self.val_metadata_reqs[t][normalized_val].append((masterlist_id, meta_record))
                 self.record_signatures[t].append({
                     "signature": full_signature,
                     "record_id": masterlist_id,
-                    "primary_value": val,
+                    "primary_value": normalized_val,
                     "metadata": {mk: mv["required_val"] for mk, mv in meta_record.items()}
                 })
         
@@ -169,6 +253,31 @@ class Validator:
         self._ann_indexes: Dict[str, Any] = {}
         if HAS_SKLEARN:
             self._build_ann_indexes()
+
+    def _normalize_value(self, field_name: str, value: str) -> str:
+        """
+        Normalize a value based on its determined data type.
+        For INTEGER fields: strip whitespace and convert to canonical integer string.
+        For STRING fields: strip whitespace only.
+        """
+        stripped = str(value).strip()
+        if self.field_types.get(field_name) == "INTEGER":
+            try:
+                return str(int(stripped))
+            except (ValueError, TypeError):
+                return stripped
+        return stripped
+        
+    def _normalize_comparison(self, val1: str, val2: str) -> bool:
+        """
+        Compare two strings after normalizing them (lowercase, stripped).
+        Ensures that 'SPEC CPU' matches 'speccpu' during validation.
+        """
+        p1 = utils.default_process(str(val1))
+        p2 = utils.default_process(str(val2))
+        if not p1 and not p2:
+            return True
+        return p1 == p2
 
     def _build_ann_indexes(self):
         """Builds TF-IDF vectorizers and NearestNeighbors indexes in parallel."""
@@ -218,6 +327,11 @@ class Validator:
                     self._ann_indexes[key] = data
  
     def get_suggestions(self, field_type: str, value: str, n: int = 3) -> List[Dict[str, Any]]:
+        """
+        Field-level suggestions.
+        Suggests closest valid values for a single field (e.g., 'Xeon' -> 'Intel Xeon Gold').
+        Algorithm: partial_ratio (Good when input is partial or incomplete).
+        """
         is_metadata = field_type not in self.primary_types
         possibilities = list(self.valid_values.get(field_type, set()))
         if not possibilities and is_metadata:
@@ -226,7 +340,12 @@ class Validator:
         if not possibilities or not value:
             return []
        
-        matches = process.extract(value, possibilities, limit=n, scorer=fuzz.partial_ratio, score_cutoff=10)
+        matches = process.extract(
+            value, possibilities, limit=n, 
+            scorer=fuzz.partial_ratio, 
+            score_cutoff=10, 
+            processor=utils.default_process
+        )
         results = []
         for i, match_info in enumerate(matches, 1):
             match, score, _ = match_info
@@ -294,8 +413,9 @@ class Validator:
  
     def get_record_level_suggestions(self, field_type: str, value: str, actual_metadata: Dict[str, str] = None, n: int = 3) -> List[Dict[str, Any]]:
         """
-        Returns top N record-level suggestions using 'Mega-String' concatenated matching.
-        Combines primary value and metadata into a single string for high-accuracy fuzzy matching.
+        Record-level suggestions for full record matching.
+        Matches entire records (value + metadata combined) using a 'Mega-String' signature.
+        Algorithm: token_set_ratio (Ignores word order and duplicates).
         """
         if actual_metadata is None:
             actual_metadata = {}
@@ -309,17 +429,19 @@ class Validator:
         actual_signature_parts = [str(value).strip()]
         for m_name in sorted(actual_metadata.keys()):
             m_val = str(actual_metadata.get(m_name, "")).strip()
-            if m_val and m_val.lower() != "nan":
+            if m_val:
                 actual_signature_parts.append(m_val)
         
-        actual_signature = " ".join(actual_signature_parts).lower()
+        # Clean the signature of null, none, -, and nan tokens
+        cleaned_parts = [p for p in actual_signature_parts if p.lower() not in IGNORED_SIGNATURE_VALUES]
+        actual_signature = " ".join(cleaned_parts).lower()
         
         # 2. Extract signatures for matching
         signature_strings = [c["signature"] for c in type_configs]
         
-        # 3. Perform Fuzzy Search using partial_ratio on Mega-Strings
-        # This handles noisy names effectively by prioritizing metadata overlaps
-        matches = process.extract(actual_signature, signature_strings, limit=n, scorer=fuzz.partial_ratio, score_cutoff=75)
+        # 3. Perform Fuzzy Search using token_set_ratio on Mega-Strings
+        # This handles noisy names effectively by ignoring word order and duplicates
+        matches = process.extract(actual_signature, signature_strings, limit=n, scorer=fuzz.token_set_ratio, score_cutoff=75)
         
         results = []
         for match_str, score, index in matches:
@@ -348,9 +470,12 @@ class Validator:
         actual_signature_parts = [str(value).strip()]
         for m_name in sorted(actual_metadata.keys()):
             m_val = str(actual_metadata.get(m_name, "")).strip()
-            if m_val and m_val.lower() != "nan":
+            if m_val:
                 actual_signature_parts.append(m_val)
-        actual_signature = " ".join(actual_signature_parts).lower()
+        
+        # Clean signature
+        cleaned_parts = [p for p in actual_signature_parts if p.lower() not in IGNORED_SIGNATURE_VALUES]
+        actual_signature = " ".join(cleaned_parts).lower()
 
         # Check search cache
         cache_key = f"rec:{field_type}:{actual_signature}:{n}"
@@ -383,12 +508,45 @@ class Validator:
         # Save to cache before returning
         self._search_cache[cache_key] = results
         return results
+
+    def has_suggestions(self, field_type: str, value: str, actual_metadata: Dict[str, str] = None) -> bool:
+        """
+        Fast existence check for any valid record-level match.
+        Stops after the first match found above the cutoff (75).
+        Algorithm: token_set_ratio (Optimized via extractOne).
+        """
+        if actual_metadata is None:
+            actual_metadata = {}
+            
+        type_configs = self.record_signatures.get(field_type, [])
+        if not type_configs or (not value and not actual_metadata):
+            return False
+            
+        # Build the 'Mega-String' signature
+        actual_signature_parts = [str(value).strip()]
+        for m_name in sorted(actual_metadata.keys()):
+            m_val = str(actual_metadata.get(m_name, "")).strip()
+            if m_val:
+                actual_signature_parts.append(m_val)
+        
+        # Clean signature
+        cleaned_parts = [p for p in actual_signature_parts if p.lower() not in IGNORED_SIGNATURE_VALUES]
+        actual_signature = " ".join(cleaned_parts).lower()
+        if not actual_signature:
+            return False
+        
+        signature_strings = [c["signature"] for c in type_configs]
+        
+        # Stops after first match → optimized
+        match = process.extractOne(actual_signature, signature_strings, scorer=fuzz.token_set_ratio, score_cutoff=75)
+        return match is not None
  
     async def validate_doc(self, db, doc: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
-        # 1. Extract values for each mapped field
+        # 1. Extract values for each mapped field (normalize based on detected type)
         field_values: Dict[str, str] = {}
         for t, path in self.mappings.items():
-            field_values[t] = str(get_nested_value(doc, path) or '').strip()
+            raw_val = str(get_nested_value(doc, path) or '').strip()
+            field_values[t] = self._normalize_value(t, raw_val)
        
         # 2. Determine which fields should be validated based on conditional rules
         should_validate: Dict[str, bool] = {}
@@ -464,22 +622,20 @@ class Validator:
                                 target_field = m_path.split(".", 1)[1]
                                 cpu_model_val = field_values.get("CPUModel", "")
                                 if cpu_model_val:
-                                    if cpu_model_val in self._processor_cache:
-                                        proc_doc = self._processor_cache[cpu_model_val]
-                                    else:
-                                        proc_doc = await db["processor_details"].find_one({"cpuModelNo": cpu_model_val})
-                                        self._processor_cache[cpu_model_val] = proc_doc
-                                    
+                                    proc_doc = self.processor_cache.get(cpu_model_val)
                                     if proc_doc:
                                         m_val = str(proc_doc.get(target_field, "")).strip()
                             else:
                                 m_val = str(get_nested_value(doc, m_path) or '').strip() if m_path else ""
                            
+                            # Normalize metadata value based on detected type
+                            m_val = self._normalize_value(m_name, m_val)
+                           
                             m_is_empty = (m_val == "" or m_val == "nan")
                             if m_is_empty:
                                 m_status = "invalid"
                                 current_errors += 1
-                            elif m_val != m_required_val:
+                            elif not self._normalize_comparison(m_val, m_required_val):
                                 m_status = "invalid"
                                 current_errors += 1
                             else:
@@ -515,16 +671,14 @@ class Validator:
                         cpu_model_val = field_values.get("CPUModel", "")
                        
                         if cpu_model_val:
-                            if cpu_model_val in self._processor_cache:
-                                proc_doc = self._processor_cache[cpu_model_val]
-                            else:
-                                proc_doc = await db["processor_details"].find_one({"cpuModelNo": cpu_model_val})
-                                self._processor_cache[cpu_model_val] = proc_doc
-                            
+                            proc_doc = self.processor_cache.get(cpu_model_val)
                             if proc_doc:
                                 m_val = str(proc_doc.get(target_field, "")).strip()
                     else:
                         m_val = str(get_nested_value(doc, m_path) or '').strip() if m_path else ""
+                       
+                    # Normalize metadata value based on detected type
+                    m_val = self._normalize_value(m_name, m_val)
                        
                     m_is_empty = (m_val == "" or m_val == "nan")
                     m_status = "invalid"
@@ -548,11 +702,32 @@ class Validator:
         return invalid_payload, field_status
  
 async def get_validator() -> Validator:
-    global _validator_instance
+    global _validator_cache
+    now = time.time()
+    if _validator_cache["instance"] and (now - _validator_cache["updated_at"]) < CACHE_TTL:
+        return _validator_cache["instance"]
+       
     async with _validator_lock:
-        if _validator_instance is None:
-            db = get_db()
-            mappings = await build_mappings()
-            ml_records = await db[MASTERLIST_COL].find({"status": "Published"}).to_list(length=None)
-            _validator_instance = Validator(ml_records, mappings)
-    return _validator_instance
+        # Re-check inside lock to prevent race conditions during initialization
+        if _validator_cache["instance"] and (now - _validator_cache["updated_at"]) < CACHE_TTL:
+            return _validator_cache["instance"]
+            
+        db = get_db()
+        mappings = await build_mappings()
+       
+        # Determine field types by scanning ExecutionInfo collection
+        field_types = await determine_field_types(db, mappings)
+       
+        ml_records = await db[MASTERLIST_COL].find({"status": "Published"}).to_list(length=None)
+        validator = Validator(ml_records, mappings, field_types)
+       
+        # Pre-populate the processor cache
+        cursor_proc = db["processor_details"].find({})
+        async for proc in cursor_proc:
+            model_no = proc.get("cpuModelNo")
+            if model_no:
+                validator.processor_cache[str(model_no)] = proc
+       
+        _validator_cache["instance"] = validator
+        _validator_cache["updated_at"] = now
+        return validator
