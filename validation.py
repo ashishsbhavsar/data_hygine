@@ -279,6 +279,22 @@ class Validator:
             return True
         return p1 == p2
 
+    def _build_signature(self, value: str, metadata: Dict[str, Any]) -> str:
+        """
+        Internal helper to build a cleaned 'Mega-String' signature.
+        Combines value and metadata, removing noise tokens.
+        """
+        # 1. Gather all parts
+        actual_signature_parts = [str(value).strip()]
+        for m_name in sorted(metadata.keys()):
+            m_val = str(metadata.get(m_name, "")).strip()
+            if m_val:
+                actual_signature_parts.append(m_val)
+        
+        # 2. Clean the signature of null, none, -, and nan tokens
+        cleaned_parts = [p for p in actual_signature_parts if p.lower() not in IGNORED_SIGNATURE_VALUES]
+        return " ".join(cleaned_parts).lower()
+
     def _build_ann_indexes(self):
         """Builds TF-IDF vectorizers and NearestNeighbors indexes in parallel."""
         if not HAS_SKLEARN:
@@ -326,7 +342,7 @@ class Validator:
                     key, data = res
                     self._ann_indexes[key] = data
  
-    def get_suggestions(self, field_type: str, value: str, n: int = 3) -> List[Dict[str, Any]]:
+    def get_suggestions(self, field_type: str, value: str, n: int = 3, score_cutoff: int = 10) -> List[Dict[str, Any]]:
         """
         Field-level suggestions.
         Suggests closest valid values for a single field (e.g., 'Xeon' -> 'Intel Xeon Gold').
@@ -343,7 +359,7 @@ class Validator:
         matches = process.extract(
             value, possibilities, limit=n, 
             scorer=fuzz.partial_ratio, 
-            score_cutoff=10, 
+            score_cutoff=score_cutoff, 
             processor=utils.default_process
         )
         results = []
@@ -363,7 +379,7 @@ class Validator:
             })
         return results
  
-    async def get_suggestions_ann(self, field_type: str, value: str, n: int = 3) -> List[Dict[str, Any]]:
+    async def get_suggestions_ann(self, field_type: str, value: str, n: int = 3, score_cutoff: float = 0.1) -> List[Dict[str, Any]]:
         """
         Asynchronous-ready Approximate Nearest Neighbor suggestion engine.
         Uses TF-IDF + Cosine Similarity to simulate partial_ratio behavior at scale.
@@ -371,8 +387,13 @@ class Validator:
         if not HAS_SKLEARN or field_type not in self._ann_indexes or not value:
             return self.get_suggestions(field_type, value, n)
 
+        # Apply same normalization as RapidFuzz for query parity
+        processed_value = utils.default_process(value)
+        if not processed_value:
+            return []
+
         # Check search cache
-        cache_key = f"sug:{field_type}:{value}:{n}"
+        cache_key = f"sug_ann:{field_type}:{processed_value}:{n}:{score_cutoff}"
         if cache_key in self._search_cache:
             return self._search_cache[cache_key]
 
@@ -382,7 +403,7 @@ class Validator:
         possibilities = index_data["possibilities"]
 
         def _search():
-            query_vec = vectorizer.transform([value])
+            query_vec = vectorizer.transform([processed_value])
             distances, indices = nn.kneighbors(query_vec, n_neighbors=min(n, len(possibilities)))
             return distances[0], indices[0]
 
@@ -396,6 +417,9 @@ class Validator:
             # Convert cosine distance to a 0-1 score (1 - dist)
             score = 1.0 - dist
             
+            if score < score_cutoff:
+                continue
+                
             if is_metadata:
                 match_id = self.all_metadata_values.get(field_type, {}).get(match, "")
             else:
@@ -410,38 +434,76 @@ class Validator:
         
         self._search_cache[cache_key] = results
         return results
+
+    async def get_record_level_suggestions_ann(self, field_type: str, value: str, actual_metadata: Dict[str, str] = None, n: int = 3, score_cutoff: float = 0.75) -> List[Dict[str, Any]]:
+        """
+        High-performance ANN version of record-level matching.
+        Compares query 'Mega-String' against the pre-vectorized signature index.
+        """
+        idx_key = f"{field_type}_signatures"
+        if not HAS_SKLEARN or idx_key not in self._ann_indexes or (not value and not actual_metadata):
+            return self.get_record_level_suggestions(field_type, value, actual_metadata, n, score_cutoff=int(score_cutoff * 100))
+
+        # 1. Build searching signature using shared logic
+        actual_signature = self._build_signature(value, actual_metadata or {})
+        if not actual_signature:
+            return []
+
+        # Check search cache
+        cache_key = f"rec_ann:{field_type}:{actual_signature}:{n}:{score_cutoff}"
+        if cache_key in self._search_cache:
+            return self._search_cache[cache_key]
+
+        index_data = self._ann_indexes[idx_key]
+        vectorizer = index_data["vectorizer"]
+        nn = index_data["nn"]
+        configs = index_data["configs"]
+
+        def _search():
+            query_vec = vectorizer.transform([actual_signature])
+            distances, indices = nn.kneighbors(query_vec, n_neighbors=min(n, len(configs)))
+            return distances[0], indices[0]
+
+        # Async search execution
+        distances, indices = await asyncio.to_thread(_search)
+        
+        results = []
+        for i, (dist, idx) in enumerate(zip(distances, indices), 1):
+            score = 1.0 - dist
+            if score < score_cutoff:
+                continue
+                
+            config = configs[idx]
+            results.append({
+                "_id": config["record_id"],
+                "primary_value": config["primary_value"],
+                "metadata": config["metadata"],
+                "score": round(float(score), 4)
+            })
+            
+        self._search_cache[cache_key] = results
+        return results
  
-    def get_record_level_suggestions(self, field_type: str, value: str, actual_metadata: Dict[str, str] = None, n: int = 3) -> List[Dict[str, Any]]:
+    def get_record_level_suggestions(self, field_type: str, value: str, actual_metadata: Dict[str, str] = None, n: int = 3, score_cutoff: int = 75) -> List[Dict[str, Any]]:
         """
         Record-level suggestions for full record matching.
         Matches entire records (value + metadata combined) using a 'Mega-String' signature.
         Algorithm: token_set_ratio (Ignores word order and duplicates).
         """
-        if actual_metadata is None:
-            actual_metadata = {}
-        
         type_configs = self.record_signatures.get(field_type, [])
         if not type_configs or (not value and not actual_metadata):
             return []
             
-        # 1. Build the 'Mega-String' signature for our ACTUAL record
-        # We include metadata values that exist to strengthen the search
-        actual_signature_parts = [str(value).strip()]
-        for m_name in sorted(actual_metadata.keys()):
-            m_val = str(actual_metadata.get(m_name, "")).strip()
-            if m_val:
-                actual_signature_parts.append(m_val)
-        
-        # Clean the signature of null, none, -, and nan tokens
-        cleaned_parts = [p for p in actual_signature_parts if p.lower() not in IGNORED_SIGNATURE_VALUES]
-        actual_signature = " ".join(cleaned_parts).lower()
-        
+        # 1. Build the 'Mega-String' signature using shared logic
+        actual_signature = self._build_signature(value, actual_metadata or {})
+        if not actual_signature:
+            return []
+            
         # 2. Extract signatures for matching
         signature_strings = [c["signature"] for c in type_configs]
         
         # 3. Perform Fuzzy Search using token_set_ratio on Mega-Strings
-        # This handles noisy names effectively by ignoring word order and duplicates
-        matches = process.extract(actual_signature, signature_strings, limit=n, scorer=fuzz.token_set_ratio, score_cutoff=75)
+        matches = process.extract(actual_signature, signature_strings, limit=n, scorer=fuzz.token_set_ratio, score_cutoff=score_cutoff)
         
         results = []
         for match_str, score, index in matches:
@@ -455,59 +517,6 @@ class Validator:
             
         return results
 
-    async def get_record_level_suggestions_ann(self, field_type: str, value: str, actual_metadata: Dict[str, str] = None, n: int = 3) -> List[Dict[str, Any]]:
-        """
-        Record-level ANN suggestions using 'Mega-String' concatenated matching.
-        Runs asynchronously in a thread pool.
-        """
-        if not HAS_SKLEARN or f"{field_type}_signatures" not in self._ann_indexes:
-            return self.get_record_level_suggestions(field_type, value, actual_metadata, n)
-
-        if actual_metadata is None:
-            actual_metadata = {}
-            
-        # Build the 'Mega-String' signature
-        actual_signature_parts = [str(value).strip()]
-        for m_name in sorted(actual_metadata.keys()):
-            m_val = str(actual_metadata.get(m_name, "")).strip()
-            if m_val:
-                actual_signature_parts.append(m_val)
-        
-        # Clean signature
-        cleaned_parts = [p for p in actual_signature_parts if p.lower() not in IGNORED_SIGNATURE_VALUES]
-        actual_signature = " ".join(cleaned_parts).lower()
-
-        # Check search cache
-        cache_key = f"rec:{field_type}:{actual_signature}:{n}"
-        if cache_key in self._search_cache:
-            return self._search_cache[cache_key]
-
-        index_data = self._ann_indexes[f"{field_type}_signatures"]
-        vectorizer = index_data["vectorizer"]
-        nn = index_data["nn"]
-        configs = index_data["configs"]
-
-        def _search():
-            query_vec = vectorizer.transform([actual_signature])
-            distances, indices = nn.kneighbors(query_vec, n_neighbors=min(n, len(configs)))
-            return distances[0], indices[0]
-
-        distances, indices = await asyncio.to_thread(_search)
-        
-        results = []
-        for dist, idx in zip(distances, indices):
-            config = configs[idx]
-            score = 1.0 - dist
-            results.append({
-                "_id": config["record_id"],
-                "primary_value": config["primary_value"],
-                "metadata": config["metadata"],
-                "score": round(float(score), 4)
-            })
-        
-        # Save to cache before returning
-        self._search_cache[cache_key] = results
-        return results
 
     def has_suggestions(self, field_type: str, value: str, actual_metadata: Dict[str, str] = None) -> bool:
         """
@@ -524,17 +533,11 @@ class Validator:
             
         # Build the 'Mega-String' signature
         actual_signature_parts = [str(value).strip()]
-        for m_name in sorted(actual_metadata.keys()):
-            m_val = str(actual_metadata.get(m_name, "")).strip()
-            if m_val:
-                actual_signature_parts.append(m_val)
-        
-        # Clean signature
-        cleaned_parts = [p for p in actual_signature_parts if p.lower() not in IGNORED_SIGNATURE_VALUES]
-        actual_signature = " ".join(cleaned_parts).lower()
+        actual_signature = self._build_signature(value, actual_metadata or {})
         if not actual_signature:
             return False
-        
+            
+        type_configs = self.record_signatures.get(field_type, [])
         signature_strings = [c["signature"] for c in type_configs]
         
         # Stops after first match → optimized
