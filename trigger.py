@@ -25,7 +25,7 @@ async def process_document(db, validator, doc):
     All other tasks (snapshots, suggestions, monitoring) are handled by other scripts.
     """
     try:
-        exec_id = doc.get("logsInfo", str(doc.get("_id")))
+        exec_id = doc.get("benchmarkExecutionID", str(doc.get("_id")))
         logger.info(f"Processing new record: {exec_id}")
  
         # 1. Run Validation using validator.py
