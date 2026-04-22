@@ -6,7 +6,7 @@ import numpy as np
 from rapidfuzz import process, fuzz, utils
 from typing import Dict, Any, Tuple, List, Set, Optional
 from utils import get_nested_value
-from database import get_db, MASTERLIST_COL
+from database import get_db, MASTERLIST_COL, EXECUTION_INFO_COL
 
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -70,7 +70,7 @@ async def determine_field_types(db, mappings: Dict[str, str]) -> Dict[str, str]:
     still_checking: Dict[str, bool] = {f: True for f in fields_to_scan}
     found_value: Dict[str, bool] = {f: False for f in fields_to_scan}
    
-    cursor = db['Executioninfo'].find({}, {"_id": 0}).limit(1000)
+    cursor = db[EXECUTION_INFO_COL].find({}, {"_id": 0}).limit(1000)
     async for doc in cursor:
         if not still_checking:
             break

@@ -34,7 +34,7 @@ async def main():
     async for doc in cursor:
         invalid_payload, field_status = await validator.validate_doc(db, doc)
         is_val = len(invalid_payload) == 0
-        exec_id = doc.get("benchmarkExecutionID", str(doc.get("_id")))
+        exec_id = doc.get("logsInfo", str(doc.get("_id")))
         
         # 1. Update Executioninfo basic status
         updates.append(UpdateOne(

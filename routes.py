@@ -158,7 +158,7 @@ async def get_invalid_records(
         search_regex = {"$regex": search, "$options": "i"}
         # Fuzzy resolution for both Type and Category
         resolved = await resolve_fuzzy_benchmarks(benchmarkType=search, benchmarkCategory=search)
-        or_filters = [{"benchmarkExecutionID": search_regex}]
+        or_filters = [{"logsInfo": search_regex}]
         
         if "benchmarkType" in resolved:
             if resolved.get("benchmarkType_is_fuzzy"):
@@ -186,7 +186,7 @@ async def get_invalid_records(
     pipeline = [
         {"$match": match_query},
         {"$group": {
-            "_id": "$benchmarkExecutionID",
+            "_id": "$logsInfo",
             "invalidPayload": {"$first": "$invalidPayload"},
             "benchmarkType": {"$first": "$benchmarkType"},
             "benchmarkCategory": {"$first": "$benchmarkCategory"}
@@ -227,7 +227,7 @@ async def get_invalid_records(
     if search or status_filter != "PENDING":
         count_pipeline = [
             {"$match": match_query},
-            {"$group": {"_id": "$benchmarkExecutionID"}},
+            {"$group": {"_id": "$logsInfo"}},
             {"$count": "total"}
         ]
         cursor = db[EXECUTION_INFO_COL].aggregate(count_pipeline)
@@ -238,7 +238,7 @@ async def get_invalid_records(
         if _report_cache["total_invalid"]["value"] is None or (time.time() - _report_cache["total_invalid"]["updated_at"]) > CACHE_TTL:
             count_pipeline = [
                 {"$match": {"isValid": False}},
-                {"$group": {"_id": "$benchmarkExecutionID"}},
+                {"$group": {"_id": "$logsInfo"}},
                 {"$count": "total"}
             ]
             cursor = db[EXECUTION_INFO_COL].aggregate(count_pipeline)
@@ -368,7 +368,7 @@ async def get_invalid_summary(
         {"$lookup": {
             "from": EXECUTION_INFO_COL,
             "localField": "execution_id",
-            "foreignField": "benchmarkExecutionID",
+            "foreignField": "logsInfo",
             "as": "exec_info"
         }},
         {"$unwind": {"path": "$exec_info", "preserveNullAndEmptyArrays": True}}
@@ -602,7 +602,7 @@ async def get_validation_counts():
     
     pipeline = [
         {"$group": {
-            "_id": "$benchmarkExecutionID",
+            "_id": "$logsInfo",
             "invalidPayload": {"$first": "$invalidPayload"}
         }},
         {"$addFields": {
@@ -728,7 +728,7 @@ async def get_snapshot_records(Execution_id: str):
         }
 
     # Fetch metadata from ExecutionInfo
-    exec_meta = await db[EXECUTION_INFO_COL].find_one({"benchmarkExecutionID": Execution_id})
+    exec_meta = await db[EXECUTION_INFO_COL].find_one({"logsInfo": Execution_id})
     if not exec_meta:
         # Fallback to empty if not found, though it should exist
         exec_meta = {}
@@ -743,7 +743,7 @@ async def get_snapshot_records(Execution_id: str):
             # The record legally passes all current validation rules.
             # Flag it as valid natively!
             await db[EXECUTION_INFO_COL].update_one(
-                {"benchmarkExecutionID": Execution_id},
+                {"logsInfo": Execution_id},
                 {
                     "$set": {"isValid": True, "invalidPayload": []},
                     "$unset": {"fieldStatus": ""}
@@ -991,7 +991,7 @@ async def search_snapshots(
         search_regex = {"$regex": search, "$options": "i"}
         # Fuzzy resolution for both Type and Category
         resolved = await resolve_fuzzy_benchmarks(benchmarkType=search, benchmarkCategory=search)
-        or_filters = [{"benchmarkExecutionID": search_regex}]
+        or_filters = [{"logsInfo": search_regex}]
         
         if "benchmarkType" in resolved:
             if resolved.get("benchmarkType_is_fuzzy"):
@@ -1019,7 +1019,7 @@ async def search_snapshots(
 
     # Get matching IDs (limited by a reasonable amount to prevent enormous $in clauses)
     # Actually, we can just use the query to find in ExecutionInfo and THEN snapshot
-    matching_ids = await db[EXECUTION_INFO_COL].distinct("benchmarkExecutionID", exec_query)
+    matching_ids = await db[EXECUTION_INFO_COL].distinct("logsInfo", exec_query)
     
     if not matching_ids:
         return {"status": "success", "data": [], "count": 0}
@@ -1033,7 +1033,7 @@ async def search_snapshots(
     async for doc in cursor:
         exec_id = doc.get("execution_id")
         # Fetch metadata for this specific record (cached or fast lookup)
-        exec_meta = await db[EXECUTION_INFO_COL].find_one({"benchmarkExecutionID": exec_id})
+        exec_meta = await db[EXECUTION_INFO_COL].find_one({"logsInfo": exec_id})
         
         item = doc["data"][0] if doc.get("data") else {}
         results.append({
@@ -1156,7 +1156,7 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
     # 4. Propagate the change to Executioninfo if a mapping exists
     if target_mapping:
         await db[EXECUTION_INFO_COL].update_one(
-            {"benchmarkExecutionID": req.execution_id},
+            {"logsInfo": req.execution_id},
             {"$set": {target_mapping: req.accepted_value}}
         )
     
@@ -1226,7 +1226,7 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
                 meta_mapping = meta_mappings.get(meta_name)
                 if meta_mapping:
                     await db[EXECUTION_INFO_COL].update_one(
-                        {"benchmarkExecutionID": req.execution_id},
+                        {"logsInfo": req.execution_id},
                         {"$set": {meta_mapping: meta_accepted_value}}
                     )
             
@@ -1289,7 +1289,7 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
         snap_data["standardization_status"] = "ACCEPTED"
         
         # --- FINAL CONSISTENCY SYNC (Double-Sync driven by History) ---
-        ei_doc = await db[EXECUTION_INFO_COL].find_one({"benchmarkExecutionID": req.execution_id})
+        ei_doc = await db[EXECUTION_INFO_COL].find_one({"logsInfo": req.execution_id})
         
         if ei_doc:
             # Build a lookup for mappings from the current snapshot structure
@@ -1330,7 +1330,7 @@ async def approve_suggestion(req: ApproveSuggestionRequest):
     # 7. Mark Executioninfo as valid ONLY if fully resolved
     if is_fully_resolved:
         await db[EXECUTION_INFO_COL].update_one(
-            {"benchmarkExecutionID": req.execution_id},
+            {"logsInfo": req.execution_id},
             {"$set": {"isValid": True}}
         )
     
@@ -1410,7 +1410,7 @@ async def reject_record(req: RejectRecordRequest):
     
     # 5. Update Executioninfo to include the entitliment_level
     await db[EXECUTION_INFO_COL].update_one(
-        {"benchmarkExecutionID": execution_id},
+        {"logsInfo": execution_id},
         {"$set": {"entitliment_level": "L0 Junk Data."}}
     )
 

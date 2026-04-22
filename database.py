@@ -17,7 +17,7 @@ if not MONGO_URI or not DB_NAME:
 
 # Collection constants for centralized management
 MASTERLIST_COL = os.environ.get("COLLECTION_MASTERLIST", "masterlist")
-EXECUTION_INFO_COL = os.environ.get("COLLECTION_EXECUTION_INFO", "ExecutionInfo")
+EXECUTION_INFO_COL = os.environ.get("COLLECTION_EXECUTION_INFO", "benchmark-framework")
 SNAPSHOT_COL = os.environ.get("COLLECTION_SNAPSHOT", "snapshot")
 PROCESSOR_DETAILS_COL = os.environ.get("COLLECTION_PROCESSOR_DETAILS", "processor details")
 

@@ -14,7 +14,7 @@ except ImportError:
 # Initialize FastAPI app
 app = FastAPI(
     title="Data Hygiene Validation API",
-    description="Engine for standardizing and validating ExecutionInfo records.",
+    description="Engine for standardizing and validating benchmark-framework records.",
     version="1.0.0"
 )
 
